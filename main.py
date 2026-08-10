@@ -2,7 +2,9 @@ import os
 import time
 import json
 import logging
+import threading
 from datetime import datetime
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import requests
 import yt_dlp
@@ -14,6 +16,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "6546621672")
 
 CHECK_INTERVAL = 180  # seconds (3 minutes)
 STATE_FILE = "last_video.json"
+PORT = int(os.getenv("PORT", 10000))
 # ============================================
 
 logging.basicConfig(
@@ -21,6 +24,24 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"TikTok Monitor is running")
+
+    def log_message(self, format, *args):
+        # Silence default HTTP logs
+        return
+
+
+def start_http_server():
+    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+    logger.info(f"HTTP health server running on port {PORT}")
+    server.serve_forever()
 
 
 def send_telegram(message: str):
@@ -65,7 +86,7 @@ def get_latest_videos(username: str, max_videos: int = 5):
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
-        "extract_flat": True,          # only metadata, no download
+        "extract_flat": True,
         "playlistend": max_videos,
         "skip_download": True,
     }
@@ -109,12 +130,11 @@ def check_for_new_videos():
         logger.warning("Could not retrieve any videos")
         return
 
-    # Newest video is usually first
     latest = videos[0]
     last_id = load_last_video_id()
 
     if last_id is None:
-        # First run - just save the current latest, don't notify
+        # First run - just save the current latest, don't notify about old video
         save_last_video_id(latest["id"])
         logger.info(f"First run. Saved latest video ID: {latest['id']}")
         send_telegram(
@@ -125,7 +145,6 @@ def check_for_new_videos():
         return
 
     if latest["id"] != last_id:
-        # New video detected!
         logger.info(f"New video found: {latest['id']}")
 
         message = (
@@ -142,7 +161,7 @@ def check_for_new_videos():
         logger.info("No new videos")
 
 
-def main():
+def monitor_loop():
     logger.info("TikTok Monitor started")
     send_telegram(
         f"✅ <b>Monitor is online</b>\n"
@@ -161,4 +180,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # Start HTTP server in background (needed for Render free tier)
+    http_thread = threading.Thread(target=start_http_server, daemon=True)
+    http_thread.start()
+
+    # Start monitoring
+    monitor_loop()
