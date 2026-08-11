@@ -1,55 +1,120 @@
-# TikTok New Video Monitor
+# TikTok Monitor v2
 
-Monitors the TikTok account **@bekimoon0042** and sends a Telegram notification with the video link as soon as a new post is detected.
+Monitors TikTok accounts, stores state in **Supabase** (survives redeploys), has a **web dashboard**, and exposes an **HTTP API** for n8n.
 
 ## Features
-- Checks every 3 minutes
-- On first deployment: immediately sends the current latest video link
-- After that: only notifies when a **new** video is posted
-- Free to run on Render
+- Multiple accounts (add/remove from UI or API)
+- Last video ID stored in Supabase → no duplicate notifications after redeploy
+- Web UI to manage accounts
+- REST API for n8n (list / add / delete / force-check)
+- Telegram notifications
 
-## Telegram Configuration
-- Bot Token: already set in the code (or use environment variable `TELEGRAM_BOT_TOKEN`)
-- Chat ID: `6546621672`
+---
 
-## Deploy on Render (Free)
+## 1. Create Supabase tables
 
-1. Go to [https://dashboard.render.com](https://dashboard.render.com)
-2. Click **New +** → **Web Service**
-3. Connect the repository: `Bekimoon0043/tiktok-monitor-beki`
-4. Configure:
-   - **Name**: `tiktok-monitor-beki` (or any name)
-   - **Runtime**: Python 3
-   - **Build Command**: `pip install -r requirements.txt`
-   - **Start Command**: `python main.py`
-   - **Instance Type**: Free
-5. (Optional but recommended) Add Environment Variables:
-   - `TELEGRAM_BOT_TOKEN` = your bot token
-   - `TELEGRAM_CHAT_ID` = `6546621672`
-6. Click **Create Web Service**
+In your Supabase project → **SQL Editor** → run this:
 
-### Keep it awake (important)
-Free services on Render sleep after 15 minutes of inactivity.  
-To keep it running 24/7 for free:
+```sql
+-- Accounts to monitor
+create table if not exists monitored_accounts (
+  id bigserial primary key,
+  username text unique not null,
+  last_video_id text,
+  last_checked_at timestamptz,
+  is_active boolean default true,
+  created_at timestamptz default now()
+);
 
-1. Create a free account on [https://uptimerobot.com](https://uptimerobot.com)
-2. Add a new **HTTP(s) Monitor**
-3. Monitor URL: your Render service URL (example: `https://tiktok-monitor-beki.onrender.com`)
-4. Monitoring Interval: **5 minutes**
+-- Optional: history of sent notifications
+create table if not exists notification_log (
+  id bigserial primary key,
+  username text,
+  video_id text,
+  video_url text,
+  caption text,
+  sent_at timestamptz default now()
+);
 
-This will ping your service every 5 minutes and prevent it from sleeping.
+-- Allow the service role full access (default for service_role key)
+-- If you use anon key, enable RLS policies as needed.
+```
 
-## Local Testing
+---
+
+## 2. Environment variables (Render)
+
+| Variable | Description |
+|----------|-------------|
+| `SUPABASE_URL` | Project URL (e.g. `https://xxxx.supabase.co`) |
+| `SUPABASE_KEY` | **service_role** key (Settings → API) |
+| `TELEGRAM_BOT_TOKEN` | Your bot token |
+| `TELEGRAM_CHAT_ID` | `6546621672` |
+| `API_KEY` | Secret for n8n (e.g. `my-n8n-secret`) |
+| `CHECK_INTERVAL` | Seconds between checks (default `180`) |
+
+---
+
+## 3. Deploy on Render
+
+1. **New** → **Web Service** → connect `Bekimoon0043/tiktok-monitor-beki`
+2. **Build Command**: `pip install -r requirements.txt`
+3. **Start Command**: `python main.py`  (or `uvicorn main:app --host 0.0.0.0 --port $PORT`)
+4. **Instance**: Free
+5. Add the environment variables above
+6. Deploy
+
+Open the Render URL → you should see the dashboard.
+
+Keep it awake with [UptimeRobot](https://uptimerobot.com) (ping `/health` every 5 min).
+
+---
+
+## 4. Web UI
+
+Visit the root URL of your service:
+- Add / pause / resume / delete accounts
+- See last video ID and last checked time
+
+---
+
+## 5. API for n8n
+
+All API routes require header:
+
+```
+X-API-Key: your-api-key
+```
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/status` | Health + account counts |
+| GET | `/api/accounts` | List all accounts |
+| POST | `/api/accounts` | Body: `{"username": "name"}` |
+| DELETE | `/api/accounts/{username}` | Remove account |
+| POST | `/api/check/{username}` | Force check now |
+| GET | `/health` | Simple health (no auth) |
+
+### n8n example
+- **HTTP Request** node
+- Method: `GET` or `POST`
+- URL: `https://your-service.onrender.com/api/accounts`
+- Header: `X-API-Key` = your secret
+
+---
+
+## Local run
 
 ```bash
+export SUPABASE_URL=...
+export SUPABASE_KEY=...
+export TELEGRAM_BOT_TOKEN=...
+export TELEGRAM_CHAT_ID=6546621672
+export API_KEY=dev-secret
 pip install -r requirements.txt
 python main.py
 ```
 
-## Notes
-- **First run**: Sends the current latest video link to Telegram, then saves it.
-- **Later runs**: Only sends a message when a newer video appears.
-- yt-dlp may occasionally fail if TikTok changes something. The script will retry on the next cycle.
-
 ---
-Made for monitoring @bekimoon0042
+
+Made for monitoring TikTok accounts with persistence + n8n integration.
