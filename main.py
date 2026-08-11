@@ -18,22 +18,22 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8296896038:AAHhtevj18C1kqC
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "6546621672")
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")  # use service_role key for full access
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")  # service_role key
 
-API_KEY = os.getenv("API_KEY", "tiktok-monitor-secret-change-me")  # for n8n / API access
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "180"))  # seconds
+API_KEY = os.getenv("API_KEY", "tiktok-monitor-secret-change-me")
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "1800"))  # 30 minutes default
+FAIL_THRESHOLD = int(os.getenv("FAIL_THRESHOLD", "3"))  # alert after N consecutive failures
 PORT = int(os.getenv("PORT", "10000"))
 # ============================================
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="TikTok Monitor", version="2.0")
-
+app = FastAPI(title="TikTok Monitor", version="2.1")
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
-# ---------- Supabase ----------
 supabase: Optional[Client] = None
+
 
 def get_supabase() -> Client:
     global supabase
@@ -45,22 +45,20 @@ def get_supabase() -> Client:
 
 
 def init_db():
-    """Ensure default account exists if table is empty (optional helper)."""
     try:
         sb = get_supabase()
         res = sb.table("monitored_accounts").select("id").limit(1).execute()
         if not res.data:
-            # Seed with the original account
             sb.table("monitored_accounts").insert({
                 "username": "bekimoon0042",
-                "is_active": True
+                "is_active": True,
+                "failure_count": 0,
             }).execute()
             logger.info("Seeded default account: bekimoon0042")
     except Exception as e:
-        logger.warning(f"Could not seed DB (table may not exist yet): {e}")
+        logger.warning(f"Could not seed DB: {e}")
 
 
-# ---------- Telegram ----------
 def send_telegram(message: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -79,8 +77,8 @@ def send_telegram(message: str):
         logger.error(f"Failed to send Telegram: {e}")
 
 
-# ---------- TikTok ----------
 def get_latest_videos(username: str, max_videos: int = 5) -> List[dict]:
+    """Returns list of videos, or empty list on failure."""
     url = f"https://www.tiktok.com/@{username}"
     ydl_opts = {
         "quiet": True,
@@ -113,33 +111,71 @@ def get_latest_videos(username: str, max_videos: int = 5) -> List[dict]:
             return videos
     except Exception as e:
         logger.error(f"yt-dlp error for @{username}: {e}")
-        return []
+        raise  # re-raise so process_account can count failures
 
 
-# ---------- Core monitor logic ----------
 def process_account(account: dict):
     username = account["username"]
     last_video_id = account.get("last_video_id")
     account_id = account["id"]
+    failure_count = int(account.get("failure_count") or 0)
+    now = datetime.now(timezone.utc).isoformat()
 
     logger.info(f"Checking @{username}...")
-    videos = get_latest_videos(username)
-    if not videos:
-        logger.warning(f"No videos retrieved for @{username}")
-        # still update last_checked
+
+    try:
+        videos = get_latest_videos(username)
+    except Exception as e:
+        # Explicit exception from yt-dlp
+        failure_count += 1
+        err_msg = str(e)[:300]
+        logger.warning(f"@{username} fetch failed ({failure_count}/{FAIL_THRESHOLD}): {err_msg}")
         try:
             get_supabase().table("monitored_accounts").update({
-                "last_checked_at": datetime.now(timezone.utc).isoformat()
+                "failure_count": failure_count,
+                "last_error": err_msg,
+                "last_checked_at": now,
+            }).eq("id", account_id).execute()
+        except Exception as db_e:
+            logger.error(f"DB update on failure: {db_e}")
+
+        if failure_count == FAIL_THRESHOLD:
+            send_telegram(
+                f"⚠️ <b>Monitor Alert</b>\n\n"
+                f"Account: <b>@{username}</b>\n"
+                f"Failed <b>{failure_count}</b> times in a row.\n\n"
+                f"Error: <code>{err_msg}</code>\n\n"
+                f"Possible causes: TikTok rate-limit, yt-dlp outdated, or profile issue."
+            )
+        return
+
+    if not videos:
+        # Empty result counts as a soft failure
+        failure_count += 1
+        err_msg = "No videos returned (empty result)"
+        logger.warning(f"@{username}: {err_msg} ({failure_count}/{FAIL_THRESHOLD})")
+        try:
+            get_supabase().table("monitored_accounts").update({
+                "failure_count": failure_count,
+                "last_error": err_msg,
+                "last_checked_at": now,
             }).eq("id", account_id).execute()
         except Exception:
             pass
+
+        if failure_count == FAIL_THRESHOLD:
+            send_telegram(
+                f"⚠️ <b>Monitor Alert</b>\n\n"
+                f"Account: <b>@{username}</b>\n"
+                f"Failed <b>{failure_count}</b> times in a row (empty results).\n\n"
+                f"Check if the account exists and is public."
+            )
         return
 
+    # Success — reset failure counter
     latest = videos[0]
-    now = datetime.now(timezone.utc).isoformat()
 
     if last_video_id is None:
-        # First time seeing this account — send current latest video
         message = (
             f"🚀 <b>Monitor Started / First Check</b>\n\n"
             f"Account: <b>@{username}</b>\n\n"
@@ -153,8 +189,9 @@ def process_account(account: dict):
             get_supabase().table("monitored_accounts").update({
                 "last_video_id": latest["id"],
                 "last_checked_at": now,
+                "failure_count": 0,
+                "last_error": None,
             }).eq("id", account_id).execute()
-            # optional log
             get_supabase().table("notification_log").insert({
                 "username": username,
                 "video_id": latest["id"],
@@ -178,6 +215,8 @@ def process_account(account: dict):
             get_supabase().table("monitored_accounts").update({
                 "last_video_id": latest["id"],
                 "last_checked_at": now,
+                "failure_count": 0,
+                "last_error": None,
             }).eq("id", account_id).execute()
             get_supabase().table("notification_log").insert({
                 "username": username,
@@ -192,14 +231,15 @@ def process_account(account: dict):
         try:
             get_supabase().table("monitored_accounts").update({
                 "last_checked_at": now,
+                "failure_count": 0,
+                "last_error": None,
             }).eq("id", account_id).execute()
         except Exception:
             pass
 
 
 def monitor_loop():
-    logger.info("Background monitor started")
-    # wait a few seconds for app to boot
+    logger.info(f"Background monitor started (interval={CHECK_INTERVAL}s, fail_threshold={FAIL_THRESHOLD})")
     time.sleep(5)
     while True:
         try:
@@ -212,31 +252,25 @@ def monitor_loop():
                     process_account(acc)
                 except Exception as e:
                     logger.error(f"Error processing @{acc.get('username')}: {e}")
+                # small delay between accounts to be gentle
+                time.sleep(5)
         except Exception as e:
             logger.error(f"Monitor loop error: {e}")
-        logger.info(f"Sleeping {CHECK_INTERVAL}s...")
+        logger.info(f"Sleeping {CHECK_INTERVAL}s ({CHECK_INTERVAL // 60} min)...")
         time.sleep(CHECK_INTERVAL)
 
 
-# ---------- Auth helper ----------
 def verify_api_key(api_key: Optional[str] = Depends(api_key_header)):
     if api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key")
     return api_key
 
 
-# ---------- Pydantic models ----------
 class AccountCreate(BaseModel):
     username: str
     is_active: bool = True
 
 
-class AccountUpdate(BaseModel):
-    is_active: Optional[bool] = None
-    last_video_id: Optional[str] = None
-
-
-# ---------- Web UI ----------
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -264,11 +298,12 @@ HTML_TEMPLATE = """
     button.danger { background: #c0392b; }
     .api-box { font-family: ui-monospace, monospace; font-size: 0.8rem; background: #121218; padding: 1rem; border-radius: 8px; overflow-x: auto; white-space: pre-wrap; color: #a0d8ff; }
     a { color: #7eb8ff; }
+    .err { color: #ff8a8a; font-size: 0.8rem; max-width: 200px; overflow: hidden; text-overflow: ellipsis; }
   </style>
 </head>
 <body>
   <h1>🎬 TikTok Monitor</h1>
-  <p class="sub">Manage accounts · Status persists in Supabase · API ready for n8n</p>
+  <p class="sub">Check every 30 min · Failure alerts after {{ fail_threshold }} tries · API for n8n</p>
 
   <div class="card">
     <h3 style="margin-bottom: 0.75rem;">Add account</h3>
@@ -285,8 +320,9 @@ HTML_TEMPLATE = """
       <thead>
         <tr>
           <th>Username</th>
-          <th>Last video ID</th>
+          <th>Last video</th>
           <th>Last checked</th>
+          <th>Fails</th>
           <th>Status</th>
           <th>Actions</th>
         </tr>
@@ -297,6 +333,7 @@ HTML_TEMPLATE = """
           <td><a href="https://www.tiktok.com/@{{ a.username }}" target="_blank">@{{ a.username }}</a></td>
           <td style="font-family:monospace;font-size:0.8rem;">{{ a.last_video_id or '—' }}</td>
           <td>{{ a.last_checked_at or '—' }}</td>
+          <td>{{ a.failure_count or 0 }}{% if a.last_error %}<div class="err" title="{{ a.last_error }}">{{ a.last_error }}</div>{% endif %}</td>
           <td>
             {% if a.is_active %}
               <span class="badge badge-on">Active</span>
@@ -323,12 +360,13 @@ HTML_TEMPLATE = """
 
   <div class="card">
     <h3 style="margin-bottom: 0.5rem;">API for n8n</h3>
-    <p style="color:var(--muted);margin-bottom:0.75rem;font-size:0.9rem;">Send header <code>X-API-Key: {{ api_key }}</code></p>
-    <div class="api-box">GET  /api/accounts          — list accounts
-POST /api/accounts          — body: {"username": "name"}
+    <p style="color:var(--muted);margin-bottom:0.75rem;font-size:0.9rem;">Header <code>X-API-Key: {{ api_key }}</code></p>
+    <div class="api-box">GET  /api/accounts
+POST /api/accounts   body: {"username": "name"}
 DELETE /api/accounts/{username}
-GET  /api/status            — health + counts
-POST /api/check/{username}  — force check now</div>
+GET  /api/status
+POST /api/check/{username}
+GET  /health</div>
   </div>
 </body>
 </html>
@@ -345,7 +383,9 @@ async def dashboard(request: Request):
         accounts = []
         logger.error(f"Dashboard DB error: {e}")
     from jinja2 import Template
-    html = Template(HTML_TEMPLATE).render(accounts=accounts, api_key=API_KEY)
+    html = Template(HTML_TEMPLATE).render(
+        accounts=accounts, api_key=API_KEY, fail_threshold=FAIL_THRESHOLD
+    )
     return HTMLResponse(html)
 
 
@@ -359,6 +399,7 @@ async def ui_add(username: str = Form(...)):
         sb.table("monitored_accounts").upsert({
             "username": username,
             "is_active": True,
+            "failure_count": 0,
         }, on_conflict="username").execute()
     except Exception as e:
         logger.error(f"Add account error: {e}")
@@ -386,15 +427,20 @@ async def ui_delete(account_id: int):
     return RedirectResponse("/", status_code=303)
 
 
-# ---------- REST API (for n8n) ----------
 @app.get("/api/status")
 async def api_status(_: str = Depends(verify_api_key)):
     try:
         sb = get_supabase()
-        res = sb.table("monitored_accounts").select("id, is_active").execute()
+        res = sb.table("monitored_accounts").select("id, is_active, failure_count").execute()
         total = len(res.data or [])
         active = sum(1 for a in (res.data or []) if a.get("is_active"))
-        return {"ok": True, "total_accounts": total, "active_accounts": active}
+        return {
+            "ok": True,
+            "total_accounts": total,
+            "active_accounts": active,
+            "check_interval_seconds": CHECK_INTERVAL,
+            "fail_threshold": FAIL_THRESHOLD,
+        }
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
@@ -415,6 +461,7 @@ async def api_add_account(body: AccountCreate, _: str = Depends(verify_api_key))
     res = sb.table("monitored_accounts").upsert({
         "username": username,
         "is_active": body.is_active,
+        "failure_count": 0,
     }, on_conflict="username").execute()
     return {"ok": True, "account": (res.data or [None])[0]}
 
@@ -435,17 +482,15 @@ async def api_force_check(username: str, _: str = Depends(verify_api_key)):
     if not res.data:
         raise HTTPException(404, f"Account @{username} not found")
     process_account(res.data[0])
-    # return updated row
     res2 = sb.table("monitored_accounts").select("*").eq("username", username).single().execute()
     return {"ok": True, "account": res2.data}
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "interval_seconds": CHECK_INTERVAL}
 
 
-# ---------- Startup ----------
 @app.on_event("startup")
 def on_startup():
     logger.info("App starting...")
