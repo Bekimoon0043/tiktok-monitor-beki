@@ -1,32 +1,32 @@
-# TikTok Monitor v2
+# TikTok Monitor v2.1
 
-Monitors TikTok accounts, stores state in **Supabase** (survives redeploys), has a **web dashboard**, and exposes an **HTTP API** for n8n.
+Monitors TikTok accounts every **30 minutes**, stores state in Supabase, web dashboard, HTTP API for n8n, and Telegram alerts on repeated failures.
 
-## Features
-- Multiple accounts (add/remove from UI or API)
-- Last video ID stored in Supabase → no duplicate notifications after redeploy
-- Web UI to manage accounts
-- REST API for n8n (list / add / delete / force-check)
-- Telegram notifications
+## What's improved
+- Check interval: **30 minutes** (safer against rate-limits)
+- After **3 consecutive failures** → Telegram warning
+- `failure_count` + `last_error` stored in DB and shown in UI
+- yt-dlp bumped to a recent 2026 version
+- 5s delay between accounts when checking multiple
 
 ---
 
-## 1. Create Supabase tables
+## 1. Supabase tables
 
-In your Supabase project → **SQL Editor** → run this:
+Run in **SQL Editor**:
 
 ```sql
--- Accounts to monitor
 create table if not exists monitored_accounts (
   id bigserial primary key,
   username text unique not null,
   last_video_id text,
   last_checked_at timestamptz,
   is_active boolean default true,
+  failure_count int default 0,
+  last_error text,
   created_at timestamptz default now()
 );
 
--- Optional: history of sent notifications
 create table if not exists notification_log (
   id bigserial primary key,
   username text,
@@ -35,86 +35,94 @@ create table if not exists notification_log (
   caption text,
   sent_at timestamptz default now()
 );
+```
 
--- Allow the service role full access (default for service_role key)
--- If you use anon key, enable RLS policies as needed.
+If you already created the table earlier, add the new columns:
+
+```sql
+alter table monitored_accounts
+  add column if not exists failure_count int default 0,
+  add column if not exists last_error text;
 ```
 
 ---
 
-## 2. Environment variables (Render)
+## 2. Render environment variables
 
-| Variable | Description |
-|----------|-------------|
-| `SUPABASE_URL` | Project URL (e.g. `https://xxxx.supabase.co`) |
-| `SUPABASE_KEY` | **service_role** key (Settings → API) |
-| `TELEGRAM_BOT_TOKEN` | Your bot token |
-| `TELEGRAM_CHAT_ID` | `6546621672` |
-| `API_KEY` | Secret for n8n (e.g. `my-n8n-secret`) |
-| `CHECK_INTERVAL` | Seconds between checks (default `180`) |
+| Variable | Example | Notes |
+|----------|---------|--------|
+| `SUPABASE_URL` | `https://xxxx.supabase.co` | Required |
+| `SUPABASE_KEY` | service_role key | Required |
+| `TELEGRAM_BOT_TOKEN` | your token | Required |
+| `TELEGRAM_CHAT_ID` | `6546621672` | Required |
+| `API_KEY` | `my-n8n-secret` | For n8n API |
+| `CHECK_INTERVAL` | `1800` | Seconds (default 30 min) |
+| `FAIL_THRESHOLD` | `3` | Alert after N failures |
 
----
-
-## 3. Deploy on Render
-
-1. **New** → **Web Service** → connect `Bekimoon0043/tiktok-monitor-beki`
-2. **Build Command**: `pip install -r requirements.txt`
-3. **Start Command**: `python main.py`  (or `uvicorn main:app --host 0.0.0.0 --port $PORT`)
-4. **Instance**: Free
-5. Add the environment variables above
-6. Deploy
-
-Open the Render URL → you should see the dashboard.
-
-Keep it awake with [UptimeRobot](https://uptimerobot.com) (ping `/health` every 5 min).
+**Start command:** `python main.py`
 
 ---
 
-## 4. Web UI
+## 3. UptimeRobot (keep Render awake)
 
-Visit the root URL of your service:
-- Add / pause / resume / delete accounts
-- See last video ID and last checked time
+Free Render services sleep after ~15 minutes with no traffic. UptimeRobot fixes that.
+
+1. Go to [https://uptimerobot.com](https://uptimerobot.com) and log in
+2. **Add New Monitor**
+3. Settings:
+   - **Monitor Type:** HTTP(s)
+   - **Friendly Name:** TikTok Monitor
+   - **URL:** `https://YOUR-SERVICE-NAME.onrender.com/health`
+   - **Monitoring Interval:** **5 minutes**
+4. Save
+
+That pings `/health` every 5 minutes so the service stays online.
+
+Optional: enable email/SMS alerts in UptimeRobot if the monitor goes **Down** (service offline).
 
 ---
 
-## 5. API for n8n
+## 4. API for n8n
 
-All API routes require header:
-
+Header on every request:
 ```
 X-API-Key: your-api-key
 ```
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/api/status` | Health + account counts |
-| GET | `/api/accounts` | List all accounts |
-| POST | `/api/accounts` | Body: `{"username": "name"}` |
-| DELETE | `/api/accounts/{username}` | Remove account |
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/status` | Health + counts |
+| GET | `/api/accounts` | List accounts |
+| POST | `/api/accounts` | `{"username": "name"}` |
+| DELETE | `/api/accounts/{username}` | Remove |
 | POST | `/api/check/{username}` | Force check now |
-| GET | `/health` | Simple health (no auth) |
-
-### n8n example
-- **HTTP Request** node
-- Method: `GET` or `POST`
-- URL: `https://your-service.onrender.com/api/accounts`
-- Header: `X-API-Key` = your secret
+| GET | `/health` | Simple ping (no auth) |
 
 ---
 
-## Local run
+## 5. Keeping yt-dlp updated
 
-```bash
-export SUPABASE_URL=...
-export SUPABASE_KEY=...
-export TELEGRAM_BOT_TOKEN=...
-export TELEGRAM_CHAT_ID=6546621672
-export API_KEY=dev-secret
-pip install -r requirements.txt
-python main.py
-```
+About once a month (or when checks start failing):
+
+1. In `requirements.txt` set a newer version, e.g. `yt-dlp>=2026.8.1`
+2. Commit + push
+3. Redeploy on Render
+
+Or on Render: **Manual Deploy** after editing the file on GitHub.
 
 ---
 
-Made for monitoring TikTok accounts with persistence + n8n integration.
+## Behavior summary
+
+| Event | Action |
+|-------|--------|
+| First check for an account | Sends current latest video link |
+| New video detected | Sends link to Telegram |
+| Same video | Silent, updates `last_checked_at` |
+| Fetch fails 1–2 times | Increments `failure_count`, no alert |
+| Fetch fails 3 times in a row | Telegram warning + stores `last_error` |
+| Next successful check | Resets `failure_count` to 0 |
+
+---
+
+Repo: https://github.com/Bekimoon0043/tiktok-monitor-beki
