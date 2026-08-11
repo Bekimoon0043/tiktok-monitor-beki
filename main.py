@@ -10,7 +10,7 @@ import requests
 import yt_dlp
 
 # ================== CONFIG ==================
-TIKTOK_USERNAME = "b_e_k_i_"  # without @
+TIKTOK_USERNAME = "bekimoon0043"  # without @
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8296896038:AAHhtevj18C1kqCHj9-x1MO-fkVqiqa-oTQ")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "6546621672")
 
@@ -134,14 +134,21 @@ def check_for_new_videos():
     last_id = load_last_video_id()
 
     if last_id is None:
-        # First run - just save the current latest, don't notify about old video
-        save_last_video_id(latest["id"])
-        logger.info(f"First run. Saved latest video ID: {latest['id']}")
-        send_telegram(
+        # First run - send the current latest video link, then save it
+        logger.info(f"First run. Sending latest video ID: {latest['id']}")
+
+        message = (
             f"🚀 <b>TikTok Monitor Started</b>\n\n"
-            f"Now monitoring: <b>@{TIKTOK_USERNAME}</b>\n"
-            f"Current latest video saved. You will be notified of new posts."
+            f"Now monitoring: <b>@{TIKTOK_USERNAME}</b>\n\n"
+            f"🎬 <b>Latest video right now:</b>\n"
+            f"Caption: {latest['title']}\n\n"
+            f"🔗 <a href=\"{latest['url']}\">Watch Video</a>\n\n"
+            f"ID: <code>{latest['id']}</code>\n\n"
+            f"You will be notified of any new posts from now on."
         )
+
+        send_telegram(message)
+        save_last_video_id(latest["id"])
         return
 
     if latest["id"] != last_id:
@@ -163,11 +170,8 @@ def check_for_new_videos():
 
 def monitor_loop():
     logger.info("TikTok Monitor started")
-    send_telegram(
-        f"✅ <b>Monitor is online</b>\n"
-        f"Watching: @{TIKTOK_USERNAME}\n"
-        f"Check interval: {CHECK_INTERVAL} seconds"
-    )
+    # Note: the "online" message is now combined with the first-run video send
+    # so we don't spam two messages on first deployment.
 
     while True:
         try:
