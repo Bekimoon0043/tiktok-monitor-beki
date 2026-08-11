@@ -10,7 +10,7 @@ import requests
 import yt_dlp
 
 # ================== CONFIG ==================
-TIKTOK_USERNAME = "bekimoon0043"  # without @
+TIKTOK_USERNAME = "bekimoon0042"  # without @
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8296896038:AAHhtevj18C1kqCHj9-x1MO-fkVqiqa-oTQ")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "6546621672")
 
