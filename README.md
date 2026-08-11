@@ -1,11 +1,11 @@
 # TikTok New Video Monitor
 
-Monitors the TikTok account **@b_e_k_i_** and sends a Telegram notification with the video link as soon as a new post is detected.
+Monitors the TikTok account **@bekimoon0043** and sends a Telegram notification with the video link as soon as a new post is detected.
 
 ## Features
 - Checks every 3 minutes
-- Sends video link + caption to Telegram
-- Saves last seen video (no duplicate notifications)
+- On first deployment: immediately sends the current latest video link
+- After that: only notifies when a **new** video is posted
 - Free to run on Render
 
 ## Telegram Configuration
@@ -47,9 +47,9 @@ python main.py
 ```
 
 ## Notes
-- First run only saves the current latest video (no notification).
-- After that, every new video will be sent to Telegram.
+- **First run**: Sends the current latest video link to Telegram, then saves it.
+- **Later runs**: Only sends a message when a newer video appears.
 - yt-dlp may occasionally fail if TikTok changes something. The script will retry on the next cycle.
 
 ---
-Made for monitoring @b_e_k_i_
+Made for monitoring @bekimoon0043
