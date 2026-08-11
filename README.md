@@ -1,6 +1,6 @@
 # TikTok New Video Monitor
 
-Monitors the TikTok account **@bekimoon0043** and sends a Telegram notification with the video link as soon as a new post is detected.
+Monitors the TikTok account **@bekimoon0042** and sends a Telegram notification with the video link as soon as a new post is detected.
 
 ## Features
 - Checks every 3 minutes
@@ -52,4 +52,4 @@ python main.py
 - yt-dlp may occasionally fail if TikTok changes something. The script will retry on the next cycle.
 
 ---
-Made for monitoring @bekimoon0043
+Made for monitoring @bekimoon0042
