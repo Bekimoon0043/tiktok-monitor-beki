@@ -486,6 +486,71 @@ async def api_force_check(username: str, _: str = Depends(verify_api_key)):
     return {"ok": True, "account": res2.data}
 
 
+def _pick_direct_format(info: dict):
+    """Return (direct_url, http_headers) for the best available mp4 format."""
+    # Some extractions resolve straight to a single playable URL
+    if info.get("url"):
+        return info.get("url"), info.get("http_headers") or {}
+
+    formats = info.get("formats") or []
+    mp4_formats = [
+        f for f in formats
+        if f.get("url") and (f.get("ext") == "mp4" or f.get("vcodec") not in (None, "none"))
+    ]
+    if not mp4_formats:
+        return None, {}
+
+    best = sorted(mp4_formats, key=lambda f: (f.get("height") or 0))[-1]
+    return best.get("url"), best.get("http_headers") or info.get("http_headers") or {}
+
+
+@app.get("/api/video/{video_id}/direct-url")
+async def api_direct_video_url(
+    video_id: str,
+    username: str,
+    _: str = Depends(verify_api_key),
+):
+    """
+    Resolves a specific TikTok video to a direct, downloadable URL.
+    Called by n8n right before downloading — TikTok's CDN links are
+    short-lived, so fetch this immediately before use, don't cache it.
+    """
+    page_url = f"https://www.tiktok.com/@{username}/video/{video_id}"
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(page_url, download=False)
+    except Exception as e:
+        raise HTTPException(502, f"yt-dlp error: {str(e)[:300]}")
+
+    direct_url, headers = _pick_direct_format(info)
+    if not direct_url:
+        raise HTTPException(502, "Could not resolve a direct video URL")
+
+    if not headers:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15",
+            "Referer": "https://www.tiktok.com/",
+        }
+
+    return {
+        "ok": True,
+        "video_id": video_id,
+        "username": username,
+        "page_url": page_url,
+        "direct_url": direct_url,
+        "http_headers": headers,
+        "ext": info.get("ext", "mp4"),
+        "duration": info.get("duration"),
+        "width": info.get("width"),
+        "height": info.get("height"),
+    }
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok", "interval_seconds": CHECK_INTERVAL}
