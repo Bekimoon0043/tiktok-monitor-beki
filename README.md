@@ -1,24 +1,19 @@
-# TikTok Monitor
+# TikTok Monitor v2.1
 
-Monitors recent videos for a TikTok account that has authorized the application through TikTok's official Display API, stores state in Supabase, provides a dashboard and HTTP API for n8n, and sends Telegram alerts when a new video appears.
+Monitors TikTok accounts every **30 minutes**, stores state in Supabase, web dashboard, HTTP API for n8n, and Telegram alerts on repeated failures.
 
-## Important access limitation
+## What's improved
+- Check interval: **30 minutes** (safer against rate-limits)
+- After **3 consecutive failures** → Telegram warning
+- `failure_count` + `last_error` stored in DB and shown in UI
+- yt-dlp bumped to a recent 2026 version
+- 5s delay between accounts when checking multiple
 
-This project no longer scrapes TikTok pages or tries to imitate human browsing. Those techniques are fragile, can violate platform rules, and are the reason the previous implementation was blocked. The monitor now calls `POST https://open.tiktokapis.com/v2/video/list/` with a user access token granted the `video.list` scope.
+---
 
-The official Display API returns the recent videos of the TikTok user who authorized the app. It cannot be used to monitor arbitrary third-party accounts without their authorization. If arbitrary public-account research is your legitimate use case, apply for TikTok's Research API separately; it is restricted to approved research clients.
+## 1. Supabase tables
 
-## What changed
-
-- Removed `yt-dlp` and direct media URL extraction.
-- Added TikTok Display API access with explicit handling for authorization failures and rate limits.
-- Default polling interval is 15 minutes, with an optional small positive jitter for load smoothing. The jitter is not intended to bypass anti-bot controls.
-- Removed hard-coded Telegram and API credentials. Any credentials previously committed to the repository should be revoked and replaced.
-- The direct-download endpoint now returns `410`; consumers should use the official `share_url` or `embed_link` returned by the API.
-
-## Supabase tables
-
-Run this SQL in the Supabase SQL Editor:
+Run in **SQL Editor**:
 
 ```sql
 create table if not exists monitored_accounts (
@@ -40,71 +35,94 @@ create table if not exists notification_log (
   caption text,
   sent_at timestamptz default now()
 );
+```
 
+If you already created the table earlier, add the new columns:
+
+```sql
 alter table monitored_accounts
   add column if not exists failure_count int default 0,
   add column if not exists last_error text;
 ```
 
-## TikTok authorization
+---
 
-Create a TikTok developer app with Login Kit and the TikTok API product enabled. Request the `user.info.basic` and `video.list` scopes, complete the OAuth authorization flow for the account to be monitored, and store the resulting access token in `TIKTOK_ACCESS_TOKEN`. TikTok access tokens expire and must be refreshed through the official refresh-token flow; do not commit tokens to Git.
+## 2. Render environment variables
 
-The API client requests only metadata and links: `id`, `title`, `video_description`, `share_url`, `embed_link`, and `create_time`. It does not download or resolve TikTok media files.
+| Variable | Example | Notes |
+|----------|---------|--------|
+| `SUPABASE_URL` | `https://xxxx.supabase.co` | Required |
+| `SUPABASE_KEY` | service_role key | Required |
+| `TELEGRAM_BOT_TOKEN` | your token | Required |
+| `TELEGRAM_CHAT_ID` | `6546621672` | Required |
+| `API_KEY` | `my-n8n-secret` | For n8n API |
+| `CHECK_INTERVAL` | `1800` | Seconds (default 30 min) |
+| `FAIL_THRESHOLD` | `3` | Alert after N failures |
 
-## Environment variables
+**Start command:** `python main.py`
 
-| Variable | Required | Description |
-|---|---:|---|
-| `SUPABASE_URL` | Yes | Supabase project URL |
-| `SUPABASE_KEY` | Yes | Supabase service-role key; keep it server-side |
-| `TIKTOK_ACCESS_TOKEN` | Yes | Access token authorized for `video.list` |
-| `TELEGRAM_BOT_TOKEN` | Yes for alerts | Telegram bot token |
-| `TELEGRAM_CHAT_ID` | Yes for alerts | Destination chat ID |
-| `API_KEY` | Yes for n8n | Secret for the `X-API-Key` header |
-| `CHECK_INTERVAL` | No | Poll interval in seconds; minimum 300, default 900 |
-| `CHECK_JITTER_SECONDS` | No | Extra random delay from 0 to this value for load smoothing; default 60 |
-| `FAIL_THRESHOLD` | No | Alert after this many consecutive failures; default 3 |
-| `PORT` | No | HTTP port; default 10000 |
+---
 
-## Run
+## 3. UptimeRobot (keep Render awake)
 
-```bash
-pip install -r requirements.txt
-python main.py
+Free Render services sleep after ~15 minutes with no traffic. UptimeRobot fixes that.
+
+1. Go to [https://uptimerobot.com](https://uptimerobot.com) and log in
+2. **Add New Monitor**
+3. Settings:
+   - **Monitor Type:** HTTP(s)
+   - **Friendly Name:** TikTok Monitor
+   - **URL:** `https://YOUR-SERVICE-NAME.onrender.com/health`
+   - **Monitoring Interval:** **5 minutes**
+4. Save
+
+That pings `/health` every 5 minutes so the service stays online.
+
+Optional: enable email/SMS alerts in UptimeRobot if the monitor goes **Down** (service offline).
+
+---
+
+## 4. API for n8n
+
+Header on every request:
 ```
-
-## API
-
-Every protected request requires:
-
-```text
 X-API-Key: your-api-key
 ```
 
 | Method | Path | Description |
-|---|---|---|
-| GET | `/api/status` | Health and account counts |
-| GET | `/api/accounts` | List monitored accounts |
-| POST | `/api/accounts` | Add or update an account, body `{"username":"name"}` |
-| DELETE | `/api/accounts/{username}` | Remove an account |
-| POST | `/api/check/{username}` | Force a permitted API check |
-| GET | `/health` | Unauthenticated liveness check |
-| GET | `/api/video/{video_id}/direct-url` | Returns `410`; direct downloading is unsupported |
+|--------|------|-------------|
+| GET | `/api/status` | Health + counts |
+| GET | `/api/accounts` | List accounts |
+| POST | `/api/accounts` | `{"username": "name"}` |
+| DELETE | `/api/accounts/{username}` | Remove |
+| POST | `/api/check/{username}` | Force check now |
+| GET | `/health` | Simple ping (no auth) |
 
-## Behavior
+---
+
+## 5. Keeping yt-dlp updated
+
+About once a month (or when checks start failing):
+
+1. In `requirements.txt` set a newer version, e.g. `yt-dlp>=2026.8.1`
+2. Commit + push
+3. Redeploy on Render
+
+Or on Render: **Manual Deploy** after editing the file on GitHub.
+
+---
+
+## Behavior summary
 
 | Event | Action |
-|---|---|
-| First successful check | Sends the current latest video link |
-| New video detected | Sends the official share or embed link to Telegram |
-| Same video | Updates `last_checked_at` without sending an alert |
-| Authorization, rate-limit, or network failure | Increments `failure_count` and records the error |
-| Repeated failures | Sends a Telegram warning after `FAIL_THRESHOLD` failures |
-| Next successful check | Resets `failure_count` to zero |
+|-------|--------|
+| First check for an account | Sends current latest video link |
+| New video detected | Sends link to Telegram |
+| Same video | Silent, updates `last_checked_at` |
+| Fetch fails 1–2 times | Increments `failure_count`, no alert |
+| Fetch fails 3 times in a row | Telegram warning + stores `last_error` |
+| Next successful check | Resets `failure_count` to 0 |
 
-## Deployment notes
+---
 
-Use a long-running service or a platform background worker for the monitor loop. Do not use a minute-level job runner that starts a new process for every check. Keep all credentials in the hosting provider's secret environment-variable store.
-
-Repository: https://github.com/Bekimoon0043/tiktok-monitor-beki
+Repo: https://github.com/Bekimoon0043/tiktok-monitor-beki
