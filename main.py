@@ -1,11 +1,12 @@
 import os
+import os
 import time
 import logging
 import threading
+import random
 from datetime import datetime, timezone
 from typing import Optional, List
 
-import yt_dlp
 import requests
 from fastapi import FastAPI, Request, HTTPException, Depends, Form
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -14,15 +15,20 @@ from pydantic import BaseModel
 from supabase import create_client, Client
 
 # ================== CONFIG ==================
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8296896038:AAHhtevj18C1kqCHj9-x1MO-fkVqiqa-oTQ")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "6546621672")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")  # service_role key
 
-API_KEY = os.getenv("API_KEY", "tiktok-monitor-secret-change-me")
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "1800"))  # 30 minutes default
-FAIL_THRESHOLD = int(os.getenv("FAIL_THRESHOLD", "3"))  # alert after N consecutive failures
+API_KEY = os.getenv("API_KEY", "")
+# TikTok Display API: the token must belong to a user who authorized video.list.
+TIKTOK_ACCESS_TOKEN = os.getenv("TIKTOK_ACCESS_TOKEN", "")
+TIKTOK_API_BASE = "https://open.tiktokapis.com/v2"
+CHECK_INTERVAL = max(int(os.getenv("CHECK_INTERVAL", "900")), 300)
+# Optional small jitter spreads scheduled requests for load smoothing; it is not a bypass.
+CHECK_JITTER_SECONDS = max(int(os.getenv("CHECK_JITTER_SECONDS", "60")), 0)
+FAIL_THRESHOLD = int(os.getenv("FAIL_THRESHOLD", "3"))
 PORT = int(os.getenv("PORT", "10000"))
 # ============================================
 
@@ -78,40 +84,48 @@ def send_telegram(message: str):
 
 
 def get_latest_videos(username: str, max_videos: int = 5) -> List[dict]:
-    """Returns list of videos, or empty list on failure."""
-    url = f"https://www.tiktok.com/@{username}"
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "extract_flat": True,
-        "playlistend": max_videos,
-        "skip_download": True,
-    }
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            if not info or "entries" not in info:
-                return []
-            videos = []
-            for entry in info.get("entries") or []:
-                if not entry:
-                    continue
-                video_id = entry.get("id")
-                title = entry.get("title") or entry.get("description") or "No caption"
-                webpage_url = (
-                    entry.get("url")
-                    or entry.get("webpage_url")
-                    or f"https://www.tiktok.com/@{username}/video/{video_id}"
-                )
-                videos.append({
-                    "id": str(video_id),
-                    "title": (title or "")[:200],
-                    "url": webpage_url,
-                })
-            return videos
-    except Exception as e:
-        logger.error(f"yt-dlp error for @{username}: {e}")
-        raise  # re-raise so process_account can count failures
+    """Fetch recent videos through TikTok's authorized Display API.
+
+    Display API access is limited to the TikTok user who granted the app the
+    ``video.list`` scope. It cannot be used to monitor arbitrary accounts.
+    """
+    if not TIKTOK_ACCESS_TOKEN:
+        raise RuntimeError("TIKTOK_ACCESS_TOKEN is not configured")
+
+    response = requests.post(
+        f"{TIKTOK_API_BASE}/video/list/",
+        params={
+            "fields": "id,title,video_description,share_url,embed_link,create_time",
+        },
+        headers={
+            "Authorization": f"Bearer {TIKTOK_ACCESS_TOKEN}",
+            "Content-Type": "application/json",
+        },
+        json={"max_count": min(max(max_videos, 1), 20)},
+        timeout=20,
+    )
+    if response.status_code in (401, 403):
+        raise RuntimeError("TikTok authorization failed; re-authorize video.list access")
+    if response.status_code == 429:
+        raise RuntimeError("TikTok API rate limit reached; retry later")
+    response.raise_for_status()
+
+    payload = response.json()
+    api_error = payload.get("error") or {}
+    if api_error.get("code") not in (None, "ok"):
+        raise RuntimeError(f"TikTok API error: {api_error.get('message', api_error.get('code'))}")
+
+    videos = []
+    for entry in (payload.get("data") or {}).get("videos") or []:
+        video_id = entry.get("id")
+        if not video_id:
+            continue
+        videos.append({
+            "id": str(video_id),
+            "title": (entry.get("title") or entry.get("video_description") or "No caption")[:200],
+            "url": entry.get("share_url") or entry.get("embed_link") or f"https://www.tiktok.com/@{username}/video/{video_id}",
+        })
+    return videos
 
 
 def process_account(account: dict):
@@ -126,7 +140,7 @@ def process_account(account: dict):
     try:
         videos = get_latest_videos(username)
     except Exception as e:
-        # Explicit exception from yt-dlp
+        # Explicit exception from the authorized TikTok API client
         failure_count += 1
         err_msg = str(e)[:300]
         logger.warning(f"@{username} fetch failed ({failure_count}/{FAIL_THRESHOLD}): {err_msg}")
@@ -145,7 +159,7 @@ def process_account(account: dict):
                 f"Account: <b>@{username}</b>\n"
                 f"Failed <b>{failure_count}</b> times in a row.\n\n"
                 f"Error: <code>{err_msg}</code>\n\n"
-                f"Possible causes: TikTok rate-limit, yt-dlp outdated, or profile issue."
+                f"Possible causes: TikTok authorization, API rate-limit, token expiry, or account configuration."
             )
         return
 
@@ -256,8 +270,9 @@ def monitor_loop():
                 time.sleep(5)
         except Exception as e:
             logger.error(f"Monitor loop error: {e}")
-        logger.info(f"Sleeping {CHECK_INTERVAL}s ({CHECK_INTERVAL // 60} min)...")
-        time.sleep(CHECK_INTERVAL)
+        delay = CHECK_INTERVAL + (random.randint(0, CHECK_JITTER_SECONDS) if CHECK_JITTER_SECONDS else 0)
+        logger.info(f"Sleeping {delay}s before the next permitted API poll...")
+        time.sleep(delay)
 
 
 def verify_api_key(api_key: Optional[str] = Depends(api_key_header)):
@@ -486,23 +501,6 @@ async def api_force_check(username: str, _: str = Depends(verify_api_key)):
     return {"ok": True, "account": res2.data}
 
 
-def _pick_direct_format(info: dict):
-    """Return (direct_url, http_headers) for the best available mp4 format."""
-    # Some extractions resolve straight to a single playable URL
-    if info.get("url"):
-        return info.get("url"), info.get("http_headers") or {}
-
-    formats = info.get("formats") or []
-    mp4_formats = [
-        f for f in formats
-        if f.get("url") and (f.get("ext") == "mp4" or f.get("vcodec") not in (None, "none"))
-    ]
-    if not mp4_formats:
-        return None, {}
-
-    best = sorted(mp4_formats, key=lambda f: (f.get("height") or 0))[-1]
-    return best.get("url"), best.get("http_headers") or info.get("http_headers") or {}
-
 
 @app.get("/api/video/{video_id}/direct-url")
 async def api_direct_video_url(
@@ -510,45 +508,15 @@ async def api_direct_video_url(
     username: str,
     _: str = Depends(verify_api_key),
 ):
+    """Direct media URL resolution is intentionally unsupported.
+
+    TikTok's authorized Display API provides share/embed links rather than a
+    downloader endpoint. Consumers should use the returned share or embed URL.
     """
-    Resolves a specific TikTok video to a direct, downloadable URL.
-    Called by n8n right before downloading — TikTok's CDN links are
-    short-lived, so fetch this immediately before use, don't cache it.
-    """
-    page_url = f"https://www.tiktok.com/@{username}/video/{video_id}"
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-    }
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(page_url, download=False)
-    except Exception as e:
-        raise HTTPException(502, f"yt-dlp error: {str(e)[:300]}")
-
-    direct_url, headers = _pick_direct_format(info)
-    if not direct_url:
-        raise HTTPException(502, "Could not resolve a direct video URL")
-
-    if not headers:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15",
-            "Referer": "https://www.tiktok.com/",
-        }
-
-    return {
-        "ok": True,
-        "video_id": video_id,
-        "username": username,
-        "page_url": page_url,
-        "direct_url": direct_url,
-        "http_headers": headers,
-        "ext": info.get("ext", "mp4"),
-        "duration": info.get("duration"),
-        "width": info.get("width"),
-        "height": info.get("height"),
-    }
+    raise HTTPException(
+        status_code=410,
+        detail="Direct media downloading is not supported. Use the TikTok share/embed URL from the monitor response.",
+    )
 
 
 @app.get("/health")
